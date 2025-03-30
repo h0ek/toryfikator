@@ -2,6 +2,8 @@
 
 Toryfikator is a Python 3 utility for routing all your system traffic through Tor on Kali Linux. The program configures both Tor and iptables to transparently redirect TCP traffic through Tor’s network, helping to anonymize your network communications.
 
+![Dragon Eats Onion](dragoneatsonion.webp)
+
 ## Features
 
 - **Tor Configuration:**  
