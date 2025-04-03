@@ -27,7 +27,8 @@ Toryfikator is a Python 3 utility for routing all your system traffic through To
 
 - Python 3
 - Root privileges (required to modify iptables and Tor configuration)
-- The `requests` library
+- The `requests` library (python3-requests)
+- Tor package installed 
 
 ## Installation
 
