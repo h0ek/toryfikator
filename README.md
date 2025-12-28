@@ -34,7 +34,7 @@ Toryfikator is a Python 3 utility for routing all your system traffic through To
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/toryfikator.git
+   git clone https://github.com/h03k/toryfikator.git
    cd toryfikator
 
 2. Install the required Python package:
