@@ -132,7 +132,9 @@ nft list ruleset
 
 ## ⚠️ Disclaimer
 
-This tool improves anonymity but **does not guarantee full anonymity**.
+This tool is primarily intended for testing Tor-based applications (e.g. onion services) and routing traffic through Tor for development or research purposes.
+
+It may improve anonymity in certain scenarios, but **does not guarantee full anonymity**
 
 For stronger isolation consider:
 
