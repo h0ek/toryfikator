@@ -1,0 +1,14 @@
+[project]
+name = "toryfikator"
+version = "0.3.0"
+description = "Transparent Tor routing using nftables"
+authors = [{name = "Hoek"}]
+readme = "README.md"
+requires-python = ">=3.9"
+
+[project.scripts]
+toryfikator = "toryfikator.cli:run"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
