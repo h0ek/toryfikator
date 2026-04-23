@@ -7,7 +7,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 
 [project.scripts]
-toryfikator = "toryfikator.cli:run"
+toryfikator = "toryfikator.cli:cli_main"
 
 [build-system]
 requires = ["setuptools"]
