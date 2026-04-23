@@ -134,7 +134,7 @@ def ensure_dependencies() -> None:
 
 
 def print_help() -> None:
-    print("Usage: toryfikator [command]")
+    print("Usage: toryfikator [command] | python -m toryfikator.cli [command]")
     print("")
     print("Commands:")
     print("  help        Show this help message")
