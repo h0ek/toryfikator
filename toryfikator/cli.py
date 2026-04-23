@@ -90,9 +90,24 @@ def command_exists(path_or_name: str) -> bool:
     return shutil.which(path_or_name) is not None
 
 
-def check_root() -> None:
-    if os.geteuid() != 0:
-        die("This command must be run as root (sudo).")
+def ensure_root() -> None:
+    if os.geteuid() == 0:
+        return
+
+    if not shutil.which("sudo"):
+        die("sudo not found. Please run this command as root.")
+
+    info("Root privileges required, re-running with sudo...")
+
+    script_path = Path(__file__).resolve()
+
+    # If running from an installed package/entrypoint, prefer module execution.
+    package_root = script_path.parent
+    if package_root.name == "toryfikator":
+        os.execvp("sudo", ["sudo", sys.executable, "-m", "toryfikator.cli", *sys.argv[1:]])
+
+    # Fallback for direct script execution.
+    os.execvp("sudo", ["sudo", sys.executable, str(script_path), *sys.argv[1:]])
 
 
 def get_uid(username: str) -> str | None:
@@ -119,7 +134,7 @@ def ensure_dependencies() -> None:
 
 
 def print_help() -> None:
-    print("Usage: sudo python3 toryfikator.py [command]")
+    print("Usage: toryfikator [command]")
     print("")
     print("Commands:")
     print("  help        Show this help message")
@@ -129,6 +144,8 @@ def print_help() -> None:
     print("  restart     Stop and then start torification")
     print("  status      Show Tor service status, torrc block status, nftables status, public IP")
     print("  uninstall   Stop torification and remove Toryfikator block from torrc")
+    print("")
+    print("Root privileges are requested automatically when needed.")
 
 
 def load_state() -> dict:
@@ -229,6 +246,7 @@ def verify_tor_config() -> None:
         stderr = (e.stderr or "").strip()
         details = "\n".join(x for x in [stdout, stderr] if x)
         die(f"Tor configuration verification failed.\n{details}")
+
 
 def verify_tor_config_soft() -> bool:
     try:
@@ -430,14 +448,14 @@ def show_status() -> None:
 
 
 def cmd_configure() -> None:
-    check_root()
+    ensure_root()
     ensure_dependencies()
     install_managed_block()
     verify_tor_config()
 
 
 def cmd_start() -> None:
-    check_root()
+    ensure_root()
     ensure_dependencies()
 
     backup = None
@@ -469,7 +487,7 @@ def cmd_start() -> None:
 
 
 def cmd_stop() -> None:
-    check_root()
+    ensure_root()
     ensure_dependencies()
     remove_nft_rules()
     restore_ipv6()
@@ -482,7 +500,7 @@ def cmd_restart() -> None:
 
 
 def cmd_uninstall() -> None:
-    check_root()
+    ensure_root()
     ensure_dependencies()
     remove_nft_rules()
     restore_ipv6()
@@ -515,7 +533,7 @@ def main() -> None:
         elif cmd == "restart":
             cmd_restart()
         elif cmd == "status":
-            check_root()
+            ensure_root()
             ensure_dependencies()
             show_status()
         elif cmd == "uninstall":
@@ -529,5 +547,9 @@ def main() -> None:
         die(f"Command failed: {' '.join(e.cmd)}\n{details}")
 
 
-def run():
+def cli_main() -> None:
+    main()
+
+
+if __name__ == "__main__":
     main()
