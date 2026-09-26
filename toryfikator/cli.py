@@ -303,6 +303,7 @@ def generate_nft_conf(uid: int | None = None) -> str:
         oifname "lo" accept
         meta nfproto ipv6 reject with icmpx type admin-prohibited
         meta skuid {uid} meta l4proto tcp accept
+        ct status dnat meta nfproto ipv4 meta l4proto tcp accept
         ip daddr {TOR_VADDR_NET} reject with icmpx type admin-prohibited
         meta l4proto {{ tcp, udp }} th dport 53 reject with icmpx type admin-prohibited
         ip daddr {{ {local} }} meta l4proto tcp accept
