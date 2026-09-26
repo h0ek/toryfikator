@@ -16,7 +16,7 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 TORRC_PATH = Path("/etc/tor/torrc")
 TOR_DEFAULTS = Path("/usr/share/tor/tor-service-defaults-torrc")
 STATE_DIR = Path("/var/lib/toryfikator")
@@ -27,6 +27,7 @@ TOR_USER = "debian-tor"
 TOR_SERVICE = "tor@default.service"
 TOR_TRANS_PORT = 9040
 TOR_DNS_PORT = 9053
+TOR_SOCKS_PORT = 9050
 TOR_VADDR_NET = "10.192.0.0/10"
 TORRC_BEGIN = "# BEGIN TORYFIKATOR"
 TORRC_END = "# END TORYFIKATOR"
@@ -370,9 +371,28 @@ def restore_legacy_ipv6() -> None:
 
 
 def check_exit() -> dict:
-    proc = run([CURL, "--disable", "--silent", "--show-error", "--fail", "--ipv4",
-                "--noproxy", "*", "--proxy", "", "--proto", "=https", "--connect-timeout", "5",
-                "--max-time", "12", "--max-filesize", "8192", "https://check.torproject.org/api/ip"], timeout=15)
+    proc = run([
+        CURL,
+        "--disable",
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--ipv4",
+        "--noproxy",
+        "",
+        "--socks5-hostname",
+        f"127.0.0.1:{TOR_SOCKS_PORT}",
+        "--proto",
+        "=https",
+        "--connect-timeout",
+        "5",
+        "--max-time",
+        "20",
+        "--max-filesize",
+        "8192",
+        "https://check.torproject.org/api/ip",
+    ], timeout=23)
+
     try:
         if len(proc.stdout) > 8192:
             raise ValueError("Oversized response")
@@ -382,8 +402,8 @@ def check_exit() -> dict:
         address = ipaddress.IPv4Address(data["IP"])
     except (ValueError, KeyError, TypeError) as exc:
         raise ToryfikatorError("Invalid response from the Tor exit check.") from exc
-    return {"IP": str(address), "IsTor": data["IsTor"]}
 
+    return {"IP": str(address), "IsTor": data["IsTor"]}
 
 def wait_for_exit(attempts: int = 6) -> dict:
     detail = "Tor has not bootstrapped yet."

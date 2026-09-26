@@ -1,6 +1,6 @@
 [project]
 name = "toryfikator"
-version = "0.4.1"
+version = "0.4.2"
 description = "Transparent Tor routing using nftables"
 authors = [{name = "Hoek"}]
 readme = "README.md"
