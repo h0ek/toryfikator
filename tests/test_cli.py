@@ -124,6 +124,7 @@ class FirewallTests(unittest.TestCase):
         self.assertIn("meta nfproto ipv6 reject", text)
         self.assertNotIn("ct state established", text)
         self.assertIn("ct status dnat meta nfproto ipv4 meta l4proto tcp accept", text)
+        self.assertIn(f"ct status dnat meta nfproto ipv4 udp dport {c.TOR_DNS_PORT} accept", text)
         self.assertIn(f"tcp dport 53 redirect to {c.TOR_TRANS_PORT}", text)
         self.assertNotIn(f"tcp dport 53 redirect to {c.TOR_DNS_PORT}", text)
         self.assertLess(text.index("udp dport 53 redirect"), text.index("ip daddr 127.0.0.0/8 return"))
