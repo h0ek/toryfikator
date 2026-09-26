@@ -9,7 +9,7 @@ from toryfikator import cli as c
 
 @unittest.skipUnless(os.environ.get("TORYFIKATOR_TOR_TEST") == "1", "Opt-in Debian Tor package validation")
 class TorPackageTests(unittest.TestCase):
-    def test_real_package_accepts_config_as_debian_tor(self):
+    def test_real_package_drops_privileges_from_root(self):
         self.assertEqual(os.geteuid(), 0)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

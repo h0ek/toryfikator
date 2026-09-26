@@ -16,7 +16,7 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 TORRC_PATH = Path("/etc/tor/torrc")
 TOR_DEFAULTS = Path("/usr/share/tor/tor-service-defaults-torrc")
 STATE_DIR = Path("/var/lib/toryfikator")
@@ -41,7 +41,6 @@ DNSPort 127.0.0.1:{TOR_DNS_PORT}
 NFT = "/usr/sbin/nft"
 SYSTEMCTL = "/usr/bin/systemctl"
 TOR_BIN = "/usr/bin/tor"
-RUNUSER = "/usr/sbin/runuser"
 CURL = "/usr/bin/curl"
 SUDO = "/usr/bin/sudo"
 NFT_FAMILY = "inet"
@@ -163,8 +162,8 @@ def managed_content(content: str) -> str:
 
 def tor_command(action: str) -> list[str]:
     quiet = ["--quiet"] if action.startswith("--dump-config") else []
-    return [RUNUSER, "-u", TOR_USER, "--", TOR_BIN, *quiet, "--defaults-torrc",
-            str(TOR_DEFAULTS), "-f", str(TORRC_PATH), *shlex.split(action)]
+    return [TOR_BIN, *quiet, "--defaults-torrc", str(TOR_DEFAULTS),
+            "-f", str(TORRC_PATH), "--RunAsDaemon", "0", *shlex.split(action)]
 
 
 def effective_config() -> dict[str, list[str]]:
@@ -406,7 +405,7 @@ def wait_for_exit(attempts: int = 6) -> dict:
 
 
 def ensure_dependencies() -> None:
-    require_binaries(NFT, SYSTEMCTL, TOR_BIN, RUNUSER, CURL)
+    require_binaries(NFT, SYSTEMCTL, TOR_BIN, CURL)
     trusted_file(TORRC_PATH)
     trusted_file(TOR_DEFAULTS)
     tor_uid()
@@ -415,7 +414,7 @@ def ensure_dependencies() -> None:
 
 
 def cmd_configure() -> None:
-    require_binaries(TOR_BIN, RUNUSER)
+    require_binaries(TOR_BIN)
     trusted_file(TOR_DEFAULTS)
     tor_uid()
     with configuration_change():
@@ -455,7 +454,7 @@ def cmd_uninstall() -> None:
     if TORRC_PATH.exists():
         content = TORRC_PATH.read_text()
         if remove_managed_block(content) != content:
-            require_binaries(TOR_BIN, RUNUSER, SYSTEMCTL)
+            require_binaries(TOR_BIN, SYSTEMCTL)
             trusted_file(TOR_DEFAULTS)
             tor_uid()
             with configuration_change(install=False) as changed:
@@ -469,10 +468,12 @@ def show_status(network_check: bool = False) -> None:
     require_binaries(NFT)
     active = nft_table_exists()
     print(f"Firewall table present: {'yes' if active else 'no'}")
+    ready = False
     try:
         pid = service_pid()
+        ready = listeners_ready(pid)
         print(f"Tor service: {TOR_SERVICE}, PID {pid}, user {TOR_USER}")
-        print(f"Owned Tor listeners ready: {'yes' if listeners_ready(pid) else 'no'}")
+        print(f"Owned Tor listeners ready: {'yes' if ready else 'no'}")
     except (OSError, ToryfikatorError) as exc:
         print(f"Tor service: unavailable ({exc})")
     if not network_check:
@@ -480,6 +481,8 @@ def show_status(network_check: bool = False) -> None:
         return
     if not active:
         raise ToryfikatorError("Refusing an exit check without Toryfikator firewall rules. Run start first.")
+    if not ready:
+        raise ToryfikatorError("Tor listeners are not ready. Fix startup and retry start; use stop for direct networking.")
     require_binaries(CURL)
     result = check_exit()
     print(f"Public IP: {result['IP']}")

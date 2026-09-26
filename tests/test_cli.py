@@ -94,11 +94,14 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), self.original)
         self.assertEqual(list(self.path.parent.glob(".torrc.*")), [])
 
-    def test_validation_runs_as_debian_tor_with_service_defaults(self):
+    def test_validation_uses_tor_privilege_drop_with_service_defaults(self):
         with patch.object(c, "run", side_effect=[result(), result(config_output())]) as run:
             c.verify_tor_config()
         args = run.call_args_list[0].args[0]
-        self.assertEqual(args[:4], [c.RUNUSER, "-u", "debian-tor", "--"])
+        self.assertEqual(args[0], c.TOR_BIN)
+        self.assertNotIn("runuser", " ".join(args))
+        self.assertNotIn("--User", args)
+        self.assertEqual(args[args.index("--RunAsDaemon") + 1], "0")
         self.assertIn(str(c.TOR_DEFAULTS), args)
         self.assertIn("--verify-config", args)
 
@@ -219,6 +222,18 @@ class LifecycleTests(unittest.TestCase):
     def test_status_check_refuses_unprotected_network(self):
         with patch.object(c, "require_binaries"), patch.object(c, "nft_table_exists", return_value=False), patch.object(c, "service_pid", side_effect=c.ToryfikatorError("off")), patch.object(c, "check_exit") as check:
             with self.assertRaises(c.ToryfikatorError):
+                c.show_status(True)
+        check.assert_not_called()
+
+    def test_status_check_refuses_missing_listeners(self):
+        with patch.object(c, "require_binaries"), patch.object(c, "nft_table_exists", return_value=True), patch.object(c, "service_pid", return_value=42), patch.object(c, "listeners_ready", return_value=False), patch.object(c, "check_exit") as check:
+            with self.assertRaisesRegex(c.ToryfikatorError, "listeners are not ready"):
+                c.show_status(True)
+        check.assert_not_called()
+
+    def test_status_check_refuses_stopped_service(self):
+        with patch.object(c, "require_binaries"), patch.object(c, "nft_table_exists", return_value=True), patch.object(c, "service_pid", side_effect=c.ToryfikatorError("stopped")), patch.object(c, "check_exit") as check:
+            with self.assertRaisesRegex(c.ToryfikatorError, "listeners are not ready"):
                 c.show_status(True)
         check.assert_not_called()
 

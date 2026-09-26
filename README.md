@@ -22,7 +22,7 @@ toryfikator stop
 toryfikator uninstall
 ```
 
-Administrator privileges are requested automatically. Tor and configuration validation run as `debian-tor`; the service is `tor@default.service`.
+Administrator privileges are requested automatically. Tor drops privileges to `debian-tor` using Debian service defaults, including during configuration validation. The service is `tor@default.service`.
 
 - `start` installs protection before restarting Tor and verifies the exit through the Tor Project API. The check may take about two minutes. Failed startup keeps protection enabled: retry `start`, or explicitly use `stop` for direct networking.
 - `restart` replaces rules atomically without opening direct Internet access. Existing direct Internet connections are blocked.
