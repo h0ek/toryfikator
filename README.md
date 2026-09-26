@@ -1,148 +1,45 @@
 # 🧅 Toryfikator
 
-Transparent Tor routing using nftables. Automatically routes all outgoing traffic through Tor using `nftables`, with DNS leak protection and minimal configuration.
+Transparent IPv4 TCP routing through Tor for **Kali Linux / Debian**, using nftables.
 
 ![Dragon Eats Onion](dragoneatsonion.webp)
 
-## ✨ Features
-
-- Transparent TCP routing → Tor (`TransPort`)
-- DNS redirection → Tor (`DNSPort`)
-- nftables
-- Automatic IPv6 disable (temporary)
-- Prevents UDP leaks
-- Excludes local/private networks
-- Auto-detects Tor user
-- Auto-sudo (no need to run manually with sudo)
-- Safe rollback on failure
-- Simple CLI
-
-## ⚙️ Requirements
-
-- Linux (tested on Kali / Debian)
-- `tor`
-- `nftables`
-- `systemd`
-- `sudo`
-
-## 📦 Installation
+## Install
 
 ```bash
+sudo apt install tor nftables curl util-linux pipx
 pipx install git+https://github.com/h0ek/toryfikator.git
 ```
 
-## 🚀 Usage
-
-No need to run with sudo — it will elevate automatically.
+## Use
 
 ```bash
 toryfikator start
-toryfikator stop
 toryfikator status
+toryfikator status --check
 toryfikator restart
-toryfikator uninstall
-```
-
-## 🔐 How it works
-
-### Tor configuration
-
-Automatically updates `/etc/tor/torrc`:
-
-```
-VirtualAddrNetworkIPv4 10.192.0.0/10
-AutomapHostsOnResolve 1
-TransPort 127.0.0.1:9040
-DNSPort 127.0.0.1:5353
-```
-
-### nftables rules
-
-Creates:
-
-```
-table inet toryfikator
-```
-
-#### NAT (output hook)
-- Redirects all TCP → `9040`
-- Redirects DNS → `5353`
-- Excludes:
-  - localhost
-  - RFC1918 ranges
-  - Tor process (`debian-tor`)
-
-#### FILTER (output hook)
-- Allows:
-  - localhost
-  - Tor DNS
-- Blocks:
-  - all other UDP (prevents leaks)
-
-### Additional protections
-
-- Disables IPv6 (temporary, restored on stop)
-- Prevents DNS leaks
-- Prevents direct UDP traffic
-
-## 🔍 Status check
-
-```bash
-toryfikator status
-```
-
-Shows:
-- Tor service state
-- nftables state
-- Public IP
-- Tor exit detection
-
-## 🧹 Cleanup
-
-Stop routing:
-
-```bash
 toryfikator stop
-```
-
-Full cleanup:
-
-```bash
 toryfikator uninstall
 ```
 
-## ⚠️ Notes
+Administrator privileges are requested automatically. Tor and configuration validation run as `debian-tor`; the service is `tor@default.service`.
 
-- Tor runs as `debian-tor` (not root)
-- Script runs as root (required for nft/sysctl/systemctl)
-- Warning:
-  ```
-  Tor is running as root
-  ```
-  during config check is expected and safely ignored
+- `start` installs protection before restarting Tor and verifies the exit through the Tor Project API. The check may take about two minutes. Failed startup keeps protection enabled: retry `start`, or explicitly use `stop` for direct networking.
+- `restart` replaces rules atomically without opening direct Internet access. Existing direct Internet connections are blocked.
+- `status` is offline; `status --check` contacts the Tor Project API.
+- `stop` removes routing rules. `uninstall` also removes the managed torrc block; neither uninstalls the Python package.
 
-## 🛠 Troubleshooting
+## Scope
 
-### No internet after start
+Uses `/etc/tor/torrc`, TCP `127.0.0.1:9040`, UDP DNS `127.0.0.1:9053`, and the `inet toryfikator` table. Existing conflicting Tor listener settings must be resolved first.
+
+IPv6 outside loopback, non-DNS UDP (except DHCPv4), ICMP and forwarded traffic are blocked. Private/CGNAT/link-local IPv4 TCP remains direct; virtual `.onion` addresses take precedence. DNS UDP is redirected to Tor; public TCP DNS uses TransPort. Tor DNS supports only A/AAAA/PTR; TCP DNS to private/local resolvers is unsupported.
+
+Rules are session-only: run `start` after reboot. Other firewall managers may remove or conflict with them. Containers/VMs are not torified: their forwarded IP traffic is blocked. This is not a sandbox for privileged/raw-packet tools or a replacement for Tor Browser, Tails or Whonix.
 
 ```bash
-systemctl status tor
-nft list ruleset
+sudo systemctl status tor@default.service --no-pager
+sudo journalctl -u tor@default.service -n 50 --no-pager
+sudo nft list table inet toryfikator
+python3 -m unittest discover -s tests -v
 ```
-
-## ⚠️ Disclaimer
-
-This tool is primarily intended for testing Tor-based applications (e.g. onion services) and routing traffic through Tor for development or research purposes.
-
-It may improve anonymity in certain scenarios, but **does not guarantee full anonymity**
-
-For stronger isolation consider:
-
-- https://tails.net/
-- https://www.whonix.org/
-
-Alternative tools:
-
-- https://github.com/Und3rf10w/kali-anonsurf
-- https://github.com/brainfucksec/kalitorify
-- https://github.com/Debajyoti0-0/ToriFY

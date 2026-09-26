@@ -1,0 +1,26 @@
+name: Tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.12', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m unittest discover -s tests -v
+      - run: python -m pip wheel --no-deps --wheel-dir /tmp/wheels .
+  network:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y nftables iproute2 util-linux tor
+      - run: sudo env TORYFIKATOR_NETNS_TEST=1 python3 -m unittest discover -s tests -p test_network.py -v
+      - run: sudo env TORYFIKATOR_TOR_TEST=1 python3 -m unittest discover -s tests -p test_tor_package.py -v

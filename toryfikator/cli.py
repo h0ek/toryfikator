@@ -1,555 +1,533 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
+import contextlib
+import fcntl
+import ipaddress
 import json
 import os
-import shutil
-import socket
+import pwd
+import shlex
+import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.request import urlopen
 
+VERSION = "0.4.0"
 TORRC_PATH = Path("/etc/tor/torrc")
+TOR_DEFAULTS = Path("/usr/share/tor/tor-service-defaults-torrc")
 STATE_DIR = Path("/var/lib/toryfikator")
 STATE_FILE = STATE_DIR / "state.json"
-
+LOCK_PATH = Path("/run/toryfikator.lock")
+PROC_ROOT = Path("/proc")
 TOR_USER = "debian-tor"
-
+TOR_SERVICE = "tor@default.service"
 TOR_TRANS_PORT = 9040
-TOR_DNS_PORT = 5353
-TOR_TRANS_ADDR = "127.0.0.1"
-TOR_DNS_ADDR = "127.0.0.1"
+TOR_DNS_PORT = 9053
 TOR_VADDR_NET = "10.192.0.0/10"
-
 TORRC_BEGIN = "# BEGIN TORYFIKATOR"
 TORRC_END = "# END TORYFIKATOR"
-
 TORRC_BLOCK = f"""{TORRC_BEGIN}
-# Managed by Toryfikator
 VirtualAddrNetworkIPv4 {TOR_VADDR_NET}
 AutomapHostsOnResolve 1
-TransPort {TOR_TRANS_ADDR}:{TOR_TRANS_PORT}
-DNSPort {TOR_DNS_ADDR}:{TOR_DNS_PORT}
+AutomapHostsSuffixes .onion
+TransPort 127.0.0.1:{TOR_TRANS_PORT}
+DNSPort 127.0.0.1:{TOR_DNS_PORT}
 {TORRC_END}
 """
-
-NFT = shutil.which("nft") or "/usr/sbin/nft"
-SYSCTL = shutil.which("sysctl") or "/usr/sbin/sysctl"
-SYSTEMCTL = shutil.which("systemctl") or "/usr/bin/systemctl"
-TOR_BIN = shutil.which("tor") or "/usr/sbin/tor"
-
+NFT = "/usr/sbin/nft"
+SYSTEMCTL = "/usr/bin/systemctl"
+TOR_BIN = "/usr/bin/tor"
+RUNUSER = "/usr/sbin/runuser"
+CURL = "/usr/bin/curl"
+SUDO = "/usr/bin/sudo"
 NFT_FAMILY = "inet"
 NFT_TABLE = "toryfikator"
-
-LOCAL_EXCLUDES_V4 = [
-    "0.0.0.0/8",
-    "10.0.0.0/8",
-    "100.64.0.0/10",
-    "127.0.0.0/8",
-    "169.254.0.0/16",
-    "172.16.0.0/12",
-    "192.168.0.0/16",
-    "224.0.0.0/4",
-    "240.0.0.0/4",
-]
+LOCAL_NETWORKS = ("10.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16")
 
 
-def info(msg: str) -> None:
-    print(f"[+] {msg}")
+class ToryfikatorError(RuntimeError):
+    pass
 
 
-def warn(msg: str) -> None:
-    print(f"[!] {msg}")
+def info(message: str) -> None:
+    print(f"[+] {message}", flush=True)
 
 
-def err(msg: str) -> None:
-    print(f"[-] {msg}")
+def warn(message: str) -> None:
+    print(f"[!] {message}", file=sys.stderr, flush=True)
 
 
-def die(msg: str, code: int = 1) -> None:
-    err(msg)
-    sys.exit(code)
-
-
-def run(cmd: list[str], check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd,
-        check=check,
-        text=True,
-        stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.PIPE if capture else None,
-    )
-
-
-def command_exists(path_or_name: str) -> bool:
-    if os.path.isabs(path_or_name):
-        return os.path.exists(path_or_name) and os.access(path_or_name, os.X_OK)
-    return shutil.which(path_or_name) is not None
+def run(cmd: list[str], *, check: bool = True, input: str | None = None,
+        timeout: float = 30) -> subprocess.CompletedProcess:
+    env = {key: value for key, value in os.environ.items()
+           if key not in {"PYTHONPATH", "PYTHONHOME"} and not key.lower().endswith("_proxy")}
+    env.update({"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"})
+    try:
+        proc = subprocess.run(cmd, input=input, text=True, capture_output=True,
+                              timeout=timeout, env=env, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise ToryfikatorError(f"Command timed out: {cmd[0]}") from exc
+    if check and proc.returncode:
+        details = (proc.stderr or proc.stdout or "No diagnostic output").strip()
+        raise ToryfikatorError(f"Command failed ({proc.returncode}): {shlex.join(cmd)}\n{details}")
+    return proc
 
 
 def ensure_root() -> None:
-    if os.geteuid() == 0:
-        return
-
-    if not shutil.which("sudo"):
-        die("sudo not found. Please run this command as root.")
-
-    info("Root privileges required, re-running with sudo...")
-
-    script_path = Path(__file__).resolve()
-
-    # If running from an installed package/entrypoint, prefer module execution.
-    package_root = script_path.parent
-    if package_root.name == "toryfikator":
-        os.execvp("sudo", ["sudo", sys.executable, "-m", "toryfikator.cli", *sys.argv[1:]])
-
-    # Fallback for direct script execution.
-    os.execvp("sudo", ["sudo", sys.executable, str(script_path), *sys.argv[1:]])
+    if os.geteuid() != 0:
+        if not os.access(SUDO, os.X_OK):
+            raise ToryfikatorError("sudo is missing; run this command as root.")
+        info("Requesting administrator privileges...")
+        os.execv(SUDO, [SUDO, "--", sys.executable, "-I", str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
-def get_uid(username: str) -> str | None:
-    try:
-        import pwd
-        return str(pwd.getpwnam(username).pw_uid)
-    except Exception:
-        return None
-
-
-def ensure_dependencies() -> None:
-    missing = []
-    for dep in [NFT, SYSCTL, SYSTEMCTL, TOR_BIN]:
-        if not command_exists(dep):
-            missing.append(dep)
+def require_binaries(*paths: str) -> None:
+    missing = [path for path in paths if not os.access(path, os.X_OK)]
     if missing:
-        die(f"Missing required binaries: {', '.join(missing)}")
-
-    if not TORRC_PATH.exists():
-        die(f"torrc not found: {TORRC_PATH}")
-
-    if get_uid(TOR_USER) is None:
-        die(f"Could not resolve required system user: {TOR_USER}")
+        raise ToryfikatorError(f"Missing binaries: {', '.join(missing)}. Install tor nftables curl util-linux.")
 
 
-def print_help() -> None:
-    print("Usage: toryfikator [command] | python -m toryfikator.cli [command]")
-    print("")
-    print("Commands:")
-    print("  help        Show this help message")
-    print("  configure   Install or update Toryfikator block in /etc/tor/torrc")
-    print("  start       Configure torrc, verify config, start/restart Tor, apply nftables rules")
-    print("  stop        Remove nftables rules and restore IPv6 settings")
-    print("  restart     Stop and then start torification")
-    print("  status      Show Tor service status, torrc block status, nftables status, public IP")
-    print("  uninstall   Stop torification and remove Toryfikator block from torrc")
-    print("")
-    print("Root privileges are requested automatically when needed.")
-
-
-def load_state() -> dict:
-    if not STATE_FILE.exists():
-        return {}
+def tor_uid() -> int:
     try:
-        return json.loads(STATE_FILE.read_text())
-    except Exception:
-        return {}
+        uid = pwd.getpwnam(TOR_USER).pw_uid
+    except KeyError as exc:
+        raise ToryfikatorError(f"System user {TOR_USER} is missing. Install the Debian/Kali tor package.") from exc
+    if uid == 0:
+        raise ToryfikatorError("Refusing to exempt UID 0 from the firewall.")
+    return uid
 
 
-def save_state(state: dict) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+@contextlib.contextmanager
+def command_lock():
+    fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            raise ToryfikatorError("Unsafe command lock file.")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ToryfikatorError("Another Toryfikator command is running.") from exc
+        yield
+    finally:
+        os.close(fd)
 
 
-def backup_file(path: Path) -> Path:
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    backup = path.with_suffix(path.suffix + f".bak.{ts}")
-    shutil.copy2(path, backup)
-    return backup
+def trusted_file(path: Path) -> os.stat_result:
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+        raise ToryfikatorError(f"Expected a root-owned, non-writable regular file: {path}")
+    return metadata
 
 
-def restore_file(src: Path, dst: Path) -> None:
-    shutil.copy2(src, dst)
-
-
-def read_torrc() -> str:
-    return TORRC_PATH.read_text()
-
-
-def write_torrc(content: str) -> None:
-    TORRC_PATH.write_text(content)
-
-
-def has_managed_block(content: str) -> bool:
-    return TORRC_BEGIN in content and TORRC_END in content
+def atomic_write(path: Path, data: bytes, metadata: os.stat_result | None = None) -> None:
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            if metadata is not None:
+                os.fchown(stream.fileno(), metadata.st_uid, metadata.st_gid)
+                os.fchmod(stream.fileno(), stat.S_IMODE(metadata.st_mode))
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def remove_managed_block(content: str) -> str:
-    if not has_managed_block(content):
+    lines = content.splitlines(keepends=True)
+    begins = [i for i, line in enumerate(lines) if line.strip() == TORRC_BEGIN]
+    ends = [i for i, line in enumerate(lines) if line.strip() == TORRC_END]
+    if not begins and not ends:
         return content
-
-    start = content.index(TORRC_BEGIN)
-    end = content.index(TORRC_END) + len(TORRC_END)
-    before = content[:start].rstrip()
-    after = content[end:].lstrip("\n")
-    rebuilt = before + ("\n\n" if before and after else "\n" if before or after else "") + after
-    return rebuilt.rstrip() + "\n"
+    if len(begins) != 1 or len(ends) != 1 or begins[0] >= ends[0]:
+        raise ToryfikatorError("Malformed Toryfikator markers in torrc; repair them before continuing.")
+    return "".join(lines[:begins[0]] + lines[ends[0] + 1:])
 
 
-def install_managed_block() -> Path | None:
-    content = read_torrc()
-    new_content = remove_managed_block(content).rstrip() + "\n\n" + TORRC_BLOCK.strip() + "\n"
-
-    if new_content == content:
-        info("torrc already contains the current Toryfikator block.")
-        return None
-
-    backup = backup_file(TORRC_PATH)
-    write_torrc(new_content)
-    info(f"Updated torrc and created backup: {backup}")
-    return backup
+def managed_content(content: str) -> str:
+    clean = remove_managed_block(content).rstrip("\r\n")
+    return (clean + "\n\n" if clean else "") + TORRC_BLOCK
 
 
-def uninstall_managed_block() -> Path | None:
-    content = read_torrc()
-
-    if not has_managed_block(content):
-        info("No Toryfikator block found in torrc.")
-        return None
-
-    backup = backup_file(TORRC_PATH)
-    new_content = remove_managed_block(content)
-    write_torrc(new_content)
-    info(f"Removed Toryfikator block from torrc. Backup: {backup}")
-    return backup
+def tor_command(action: str) -> list[str]:
+    quiet = ["--quiet"] if action.startswith("--dump-config") else []
+    return [RUNUSER, "-u", TOR_USER, "--", TOR_BIN, *quiet, "--defaults-torrc",
+            str(TOR_DEFAULTS), "-f", str(TORRC_PATH), *shlex.split(action)]
 
 
-def verify_tor_config() -> None:
+def effective_config() -> dict[str, list[str]]:
+    output = run(tor_command("--dump-config full")).stdout
+    values: dict[str, list[str]] = {}
+    for line in output.splitlines():
+        tokens = shlex.split(line, comments=True)
+        if len(tokens) > 1:
+            values.setdefault(tokens[0].lower(), []).append(" ".join(tokens[1:]))
+    return values
+
+
+def verify_tor_config(managed: bool = True) -> None:
+    run(tor_command("--verify-config"))
+    config = effective_config()
+    if config.get("user") != [TOR_USER]:
+        raise ToryfikatorError(f"Effective Tor User must be {TOR_USER}.")
+    if managed:
+        expected = {"transport": [f"127.0.0.1:{TOR_TRANS_PORT}"],
+                    "dnsport": [f"127.0.0.1:{TOR_DNS_PORT}"],
+                    "virtualaddrnetworkipv4": [TOR_VADDR_NET],
+                    "automaphostsonresolve": ["1"], "automaphostssuffixes": [".onion"]}
+        for key, value in expected.items():
+            if config.get(key) != value:
+                raise ToryfikatorError(f"Conflicting effective Tor option: {key}. Check torrc and included files.")
+        if config.get("disablenetwork", ["0"]) != ["0"]:
+            raise ToryfikatorError("DisableNetwork must be 0.")
+
+
+@contextlib.contextmanager
+def configuration_change(install: bool = True):
+    metadata = trusted_file(TORRC_PATH)
+    original = TORRC_PATH.read_bytes()
+    content = original.decode("utf-8")
+    updated = (managed_content(content) if install else remove_managed_block(content)).encode("utf-8")
+    changed = updated != original
+    if changed:
+        backup = TORRC_PATH.with_name(f"{TORRC_PATH.name}.bak.{time.time_ns()}")
+        atomic_write(backup, original, metadata)
+        info(f"Configuration backup: {backup}")
     try:
-        proc = run([TOR_BIN, "--verify-config", "-f", str(TORRC_PATH)], capture=True)
-        stdout = (proc.stdout or "").strip()
-        stderr = (proc.stderr or "").strip()
-
-        if stdout:
-            print(stdout)
-
-        if stderr:
-            for line in stderr.splitlines():
-                if "You are running Tor as root" in line:
-                    continue
-                print(line)
-
-        info("Tor configuration is valid.")
-    except subprocess.CalledProcessError as e:
-        stdout = (e.stdout or "").strip()
-        stderr = (e.stderr or "").strip()
-        details = "\n".join(x for x in [stdout, stderr] if x)
-        die(f"Tor configuration verification failed.\n{details}")
+        if changed:
+            atomic_write(TORRC_PATH, updated, metadata)
+        verify_tor_config(managed=install)
+        yield changed
+    except BaseException:
+        if changed:
+            atomic_write(TORRC_PATH, original, metadata)
+            warn("Previous torrc restored.")
+        raise
 
 
-def verify_tor_config_soft() -> bool:
+def service_properties() -> dict[str, str]:
+    proc = run([SYSTEMCTL, "show", TOR_SERVICE, "--no-pager",
+                "--property=LoadState,ActiveState,SubState,MainPID"])
+    return dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+
+
+def service_pid() -> int:
+    properties = service_properties()
+    if properties.get("LoadState") != "loaded":
+        raise ToryfikatorError(f"{TOR_SERVICE} is unavailable; install the standard Debian/Kali tor package.")
+    if properties.get("ActiveState") != "active" or properties.get("SubState") != "running":
+        raise ToryfikatorError(f"{TOR_SERVICE} is not running.")
     try:
-        verify_tor_config()
-        return True
-    except SystemExit:
-        return False
+        pid = int(properties.get("MainPID", "0"))
+    except ValueError as exc:
+        raise ToryfikatorError("Invalid MainPID returned by systemd.") from exc
+    if pid <= 0:
+        raise ToryfikatorError("Tor has no running main process.")
+    status = (PROC_ROOT / str(pid) / "status").read_text()
+    uids = next((line.split()[1:] for line in status.splitlines() if line.startswith("Uid:")), [])
+    if len(uids) != 4 or any(int(uid) != tor_uid() for uid in uids):
+        raise ToryfikatorError(f"Tor PID {pid} is not running exclusively as {TOR_USER}.")
+    if (PROC_ROOT / str(pid) / "exe").resolve() != Path(TOR_BIN).resolve():
+        raise ToryfikatorError("Tor MainPID does not point to the expected executable.")
+    return pid
 
 
-def systemctl_cmd(*args: str) -> None:
-    run([SYSTEMCTL, *args])
+def listeners_ready(pid: int) -> bool:
+    directory = PROC_ROOT / str(pid)
+    inodes = set()
+    for fd in (directory / "fd").iterdir():
+        try:
+            target = os.readlink(fd)
+        except FileNotFoundError:
+            continue
+        if target.startswith("socket:["):
+            inodes.add(target[8:-1])
+    for protocol, port, state in (("tcp", TOR_TRANS_PORT, "0A"), ("udp", TOR_DNS_PORT, "07")):
+        address = f"0100007F:{port:04X}"
+        rows = [line.split() for line in (directory / "net" / protocol).read_text().splitlines()[1:]]
+        if not any(len(row) > 9 and row[1] == address and row[3] == state
+                   and row[9] in inodes for row in rows):
+            return False
+    return True
 
 
-def is_tor_active() -> bool:
-    proc = run([SYSTEMCTL, "is-active", "tor"], check=False, capture=True)
-    return proc.returncode == 0 and (proc.stdout or "").strip() == "active"
-
-
-def ensure_tor_running() -> None:
-    if is_tor_active():
-        info("Tor service is active. Restarting it...")
-        systemctl_cmd("restart", "tor")
-    else:
-        info("Tor service is not active. Starting it...")
-        systemctl_cmd("start", "tor")
-
-    if not is_tor_active():
-        die("Tor service did not become active.")
-
-    info("Tor service is active.")
+def wait_for_listeners(timeout: float = 15) -> None:
+    deadline = time.monotonic() + timeout
+    detail = "Tor listeners are unavailable."
+    while time.monotonic() < deadline:
+        try:
+            if listeners_ready(service_pid()):
+                return
+        except (OSError, ToryfikatorError) as exc:
+            detail = str(exc)
+        time.sleep(0.25)
+    raise ToryfikatorError(f"Tor did not expose its TCP/UDP listeners: {detail}")
 
 
 def nft_table_exists() -> bool:
-    proc = run([NFT, "list", "table", NFT_FAMILY, NFT_TABLE], check=False, capture=True)
-    return proc.returncode == 0
+    data = json.loads(run([NFT, "-j", "list", "tables"]).stdout)
+    return any(item.get("table", {}).get("family") == NFT_FAMILY
+               and item.get("table", {}).get("name") == NFT_TABLE for item in data["nftables"])
 
 
-def nft_backend() -> str:
-    proc = run([NFT, "--version"], check=False, capture=True)
-    return ((proc.stdout or "") + (proc.stderr or "")).strip() or "unknown"
-
-
-def generate_nft_conf() -> str:
-    tor_uid = get_uid(TOR_USER)
-    if tor_uid is None:
-        die(f"Could not resolve user: {TOR_USER}")
-
-    excludes = ", ".join(LOCAL_EXCLUDES_V4)
-
-    return f"""table {NFT_FAMILY} {NFT_TABLE} {{
+def generate_nft_conf(uid: int | None = None) -> str:
+    uid = tor_uid() if uid is None else uid
+    if not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0:
+        raise ToryfikatorError("Invalid Tor UID.")
+    local = ", ".join(LOCAL_NETWORKS)
+    return f"""table inet toryfikator {{
     chain nat_output {{
         type nat hook output priority -100; policy accept;
-
-        meta skuid {tor_uid} return
+        meta skuid {uid} return
+        meta nfproto ipv4 udp dport 53 redirect to {TOR_DNS_PORT}
+        meta nfproto ipv4 tcp dport 53 redirect to {TOR_TRANS_PORT}
+        ip daddr {TOR_VADDR_NET} meta l4proto tcp redirect to {TOR_TRANS_PORT}
         ip daddr 127.0.0.0/8 return
-
-        udp dport 53 redirect to {TOR_DNS_PORT}
-        tcp dport 53 redirect to {TOR_DNS_PORT}
-
-        ip daddr {{ {excludes} }} return
-
-        meta l4proto tcp redirect to {TOR_TRANS_PORT}
+        ip daddr {{ {local} }} return
+        meta nfproto ipv4 meta l4proto tcp redirect to {TOR_TRANS_PORT}
     }}
-
     chain filter_output {{
-        type filter hook output priority 0; policy accept;
-
-        meta skuid {tor_uid} return
-        oifname "lo" return
-        ip daddr 127.0.0.0/8 return
-
-        udp dport {TOR_DNS_PORT} ip daddr 127.0.0.1 return
-        tcp dport {TOR_DNS_PORT} ip daddr 127.0.0.1 return
-
-        meta l4proto udp reject with icmpx type port-unreachable
+        type filter hook output priority 0; policy drop;
+        oifname "lo" accept
+        meta nfproto ipv6 reject with icmpx type admin-prohibited
+        meta skuid {uid} meta l4proto tcp accept
+        ip daddr {TOR_VADDR_NET} reject with icmpx type admin-prohibited
+        meta l4proto {{ tcp, udp }} th dport 53 reject with icmpx type admin-prohibited
+        ip daddr {{ {local} }} meta l4proto tcp accept
+        udp sport 68 udp dport 67 accept
+        reject with icmpx type admin-prohibited
+    }}
+    chain filter_forward {{
+        type filter hook forward priority 0; policy drop;
     }}
 }}
 """
 
 
 def apply_nft_rules() -> None:
-    conf = generate_nft_conf()
-
-    if nft_table_exists():
-        run([NFT, "delete", "table", NFT_FAMILY, NFT_TABLE], check=False)
-
-    subprocess.run([NFT, "-f", "-"], input=conf, text=True, check=True)
-    info("nftables rules applied.")
+    prefix = f"delete table {NFT_FAMILY} {NFT_TABLE}\n" if nft_table_exists() else ""
+    batch = prefix + generate_nft_conf()
+    run([NFT, "--check", "-f", "-"], input=batch)
+    run([NFT, "-f", "-"], input=batch)
 
 
 def remove_nft_rules() -> None:
     if nft_table_exists():
-        run([NFT, "delete", "table", NFT_FAMILY, NFT_TABLE], check=False)
-        info("nftables rules removed.")
-    else:
-        info("No nftables table found, nothing to remove.")
+        run([NFT, "delete", "table", NFT_FAMILY, NFT_TABLE])
 
 
-def read_sysctl(key: str) -> str | None:
-    proc = run([SYSCTL, "-n", key], check=False, capture=True)
-    if proc.returncode != 0:
-        return None
-    return (proc.stdout or "").strip()
+def load_state() -> dict:
+    if not STATE_FILE.exists() and not STATE_FILE.is_symlink():
+        return {}
+    trusted_file(STATE_FILE)
+    try:
+        data = json.loads(STATE_FILE.read_text())
+    except ValueError as exc:
+        raise ToryfikatorError(f"Invalid state file: {STATE_FILE}; refusing to guess previous IPv6 settings.") from exc
+    if not isinstance(data, dict):
+        raise ToryfikatorError("Invalid state structure.")
+    return data
 
 
-def write_sysctl(key: str, value: str) -> None:
-    run([SYSCTL, "-w", f"{key}={value}"])
+def save_state(data: dict) -> None:
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    metadata = STATE_DIR.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+        raise ToryfikatorError("Unsafe state directory.")
+    if STATE_FILE.exists() or STATE_FILE.is_symlink():
+        trusted_file(STATE_FILE)
+    atomic_write(STATE_FILE, (json.dumps(data, indent=2) + "\n").encode())
 
 
-def disable_ipv6_temporarily() -> None:
-    state = load_state()
-    if "ipv6_previous" in state:
-        info("IPv6 state already saved.")
+def restore_legacy_ipv6() -> None:
+    data = load_state()
+    previous = data.get("ipv6_previous")
+    if previous is None:
         return
-
-    keys = [
-        "net.ipv6.conf.all.disable_ipv6",
-        "net.ipv6.conf.default.disable_ipv6",
-    ]
-
-    previous = {}
-    for key in keys:
-        previous[key] = read_sysctl(key)
-
-    state["ipv6_previous"] = previous
-    save_state(state)
-
-    for key in keys:
-        write_sysctl(key, "1")
-
-    info("IPv6 disabled temporarily for the torified session.")
+    allowed = {"net.ipv6.conf.all.disable_ipv6", "net.ipv6.conf.default.disable_ipv6"}
+    if not isinstance(previous, dict) or any(key not in allowed or value not in (None, "0", "1")
+                                             for key, value in previous.items()):
+        raise ToryfikatorError("Invalid legacy IPv6 state.")
+    for key in sorted(previous):
+        value = previous[key]
+        path = PROC_ROOT / "sys" / Path(key.replace(".", "/"))
+        if value is not None and path.exists():
+            path.write_text(value + "\n")
+    data.pop("ipv6_previous")
+    save_state(data)
+    info("Restored IPv6 settings recorded by version 0.3.0.")
 
 
-def restore_ipv6() -> None:
-    state = load_state()
-    previous = state.get("ipv6_previous")
-    if not previous:
-        info("No saved IPv6 state found.")
-        return
+def check_exit() -> dict:
+    proc = run([CURL, "--disable", "--silent", "--show-error", "--fail", "--ipv4",
+                "--noproxy", "*", "--proxy", "", "--proto", "=https", "--connect-timeout", "5",
+                "--max-time", "12", "--max-filesize", "8192", "https://check.torproject.org/api/ip"], timeout=15)
+    try:
+        if len(proc.stdout) > 8192:
+            raise ValueError("Oversized response")
+        data = json.loads(proc.stdout)
+        if not isinstance(data, dict) or not isinstance(data.get("IsTor"), bool):
+            raise ValueError("Unexpected response")
+        address = ipaddress.IPv4Address(data["IP"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ToryfikatorError("Invalid response from the Tor exit check.") from exc
+    return {"IP": str(address), "IsTor": data["IsTor"]}
 
-    for key, value in previous.items():
-        if value is not None:
-            write_sysctl(key, value)
 
-    state.pop("ipv6_previous", None)
-    save_state(state)
-    info("IPv6 settings restored.")
-
-
-def get_public_ip_info() -> dict:
-    urls = [
-        "https://check.torproject.org/api/ip",
-        "https://api.ipify.org?format=json",
-    ]
-
-    for url in urls:
+def wait_for_exit(attempts: int = 6) -> dict:
+    detail = "Tor has not bootstrapped yet."
+    for attempt in range(attempts):
+        if not nft_table_exists():
+            raise ToryfikatorError("Toryfikator firewall was removed during startup.")
+        service_pid()
         try:
-            with urlopen(url, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                if "check.torproject.org" in url:
-                    return {
-                        "source": "check.torproject.org",
-                        "ip": data.get("IP", "Unknown"),
-                        "is_tor": bool(data.get("IsTor", False)),
-                    }
-                return {
-                    "source": "api.ipify.org",
-                    "ip": data.get("ip", "Unknown"),
-                    "is_tor": None,
-                }
-        except (URLError, HTTPError, TimeoutError, socket.timeout, ValueError, json.JSONDecodeError):
-            continue
-
-    return {
-        "source": "unavailable",
-        "ip": "Unknown",
-        "is_tor": None,
-    }
+            data = check_exit()
+        except (OSError, ToryfikatorError) as exc:
+            detail = str(exc)
+        else:
+            if not data["IsTor"]:
+                raise ToryfikatorError("Exit check reports a non-Tor address. Check conflicting firewall/NAT rules.")
+            return data
+        if attempt + 1 < attempts:
+            time.sleep(2)
+    raise ToryfikatorError(f"Tor exit check failed. Retry start after checking Tor/network availability. {detail}")
 
 
-def show_status() -> None:
-    print("=== Toryfikator status ===")
-    print(f"Tor service active : {'yes' if is_tor_active() else 'no'}")
-    print(f"torrc block present: {'yes' if has_managed_block(read_torrc()) else 'no'}")
-    print(f"nft backend        : {nft_backend()}")
-    print(f"nft table active   : {'yes' if nft_table_exists() else 'no'}")
-
-    state = load_state()
-    ipv6_saved = "ipv6_previous" in state
-    print(f"ipv6 managed       : {'yes' if ipv6_saved else 'no'}")
-
-    ip_info = get_public_ip_info()
-    print(f"public ip source   : {ip_info['source']}")
-    print(f"public ip          : {ip_info['ip']}")
-    if ip_info["is_tor"] is None:
-        print("is tor exit ip     : unknown")
-    else:
-        print(f"is tor exit ip     : {'yes' if ip_info['is_tor'] else 'no'}")
+def ensure_dependencies() -> None:
+    require_binaries(NFT, SYSTEMCTL, TOR_BIN, RUNUSER, CURL)
+    trusted_file(TORRC_PATH)
+    trusted_file(TOR_DEFAULTS)
+    tor_uid()
+    if service_properties().get("LoadState") != "loaded":
+        raise ToryfikatorError(f"Required service is missing: {TOR_SERVICE}")
 
 
 def cmd_configure() -> None:
-    ensure_root()
-    ensure_dependencies()
-    install_managed_block()
-    verify_tor_config()
+    require_binaries(TOR_BIN, RUNUSER)
+    trusted_file(TOR_DEFAULTS)
+    tor_uid()
+    with configuration_change():
+        pass
+    info("Tor configuration validated as debian-tor. Run start to activate routing.")
 
 
 def cmd_start() -> None:
-    ensure_root()
     ensure_dependencies()
-
-    backup = None
+    load_state()
+    info("Installing firewall protection before restarting Tor...")
+    apply_nft_rules()
     try:
-        backup = install_managed_block()
-        verify_tor_config()
-        ensure_tor_running()
-        disable_ipv6_temporarily()
-        apply_nft_rules()
-        info("Torification started.")
-    except Exception as e:
-        warn(f"Start failed: {e}")
-        warn("Rolling back nftables, IPv6 state, and torrc if needed.")
-        try:
-            remove_nft_rules()
-        except Exception:
+        restore_legacy_ipv6()
+        with configuration_change():
             pass
-        try:
-            restore_ipv6()
-        except Exception:
-            pass
-        if backup and backup.exists():
-            try:
-                restore_file(backup, TORRC_PATH)
-                warn(f"Restored torrc from backup: {backup}")
-            except Exception as restore_error:
-                warn(f"Failed to restore torrc backup: {restore_error}")
+        run([SYSTEMCTL, "restart", TOR_SERVICE], timeout=90)
+        wait_for_listeners()
+        info("Waiting for Tor bootstrap and checking the exit address...")
+        result = wait_for_exit()
+    except BaseException:
+        warn("Startup failed. Firewall protection remains enabled; retry start or use stop to restore direct networking.")
         raise
+    info(f"Torification started. Verified Tor exit: {result['IP']}")
 
 
 def cmd_stop() -> None:
-    ensure_root()
-    ensure_dependencies()
+    require_binaries(NFT)
+    restore_legacy_ipv6()
     remove_nft_rules()
-    restore_ipv6()
-    info("Torification stopped.")
-
-
-def cmd_restart() -> None:
-    cmd_stop()
-    cmd_start()
+    info("Torification stopped. Direct networking is enabled.")
 
 
 def cmd_uninstall() -> None:
-    ensure_root()
-    ensure_dependencies()
+    require_binaries(NFT)
+    restore_legacy_ipv6()
+    if TORRC_PATH.exists():
+        content = TORRC_PATH.read_text()
+        if remove_managed_block(content) != content:
+            require_binaries(TOR_BIN, RUNUSER, SYSTEMCTL)
+            trusted_file(TOR_DEFAULTS)
+            tor_uid()
+            with configuration_change(install=False) as changed:
+                if changed and service_properties().get("ActiveState") == "active":
+                    run([SYSTEMCTL, "restart", TOR_SERVICE], timeout=90)
     remove_nft_rules()
-    restore_ipv6()
-    uninstall_managed_block()
-
-    if not verify_tor_config_soft():
-        warn("Tor configuration verification failed after uninstall.")
-        warn("This may be caused by unrelated existing issues in your torrc.")
-
-    if is_tor_active():
-        systemctl_cmd("restart", "tor")
-
-    info("Toryfikator configuration uninstalled.")
+    info("Toryfikator configuration removed. Direct networking is enabled.")
 
 
-def main() -> None:
-    if len(sys.argv) < 2 or sys.argv[1] == "help":
-        print_help()
-        return
-
-    cmd = sys.argv[1].strip().lower()
-
+def show_status(network_check: bool = False) -> None:
+    require_binaries(NFT)
+    active = nft_table_exists()
+    print(f"Firewall table present: {'yes' if active else 'no'}")
     try:
-        if cmd == "configure":
-            cmd_configure()
-        elif cmd == "start":
-            cmd_start()
-        elif cmd == "stop":
-            cmd_stop()
-        elif cmd == "restart":
-            cmd_restart()
-        elif cmd == "status":
-            ensure_root()
-            ensure_dependencies()
-            show_status()
-        elif cmd == "uninstall":
-            cmd_uninstall()
-        else:
-            die("Unknown command. Use 'help' to see available commands.")
-    except subprocess.CalledProcessError as e:
-        stdout = (e.stdout or "").strip()
-        stderr = (e.stderr or "").strip()
-        details = "\n".join(x for x in [stdout, stderr] if x)
-        die(f"Command failed: {' '.join(e.cmd)}\n{details}")
+        pid = service_pid()
+        print(f"Tor service: {TOR_SERVICE}, PID {pid}, user {TOR_USER}")
+        print(f"Owned Tor listeners ready: {'yes' if listeners_ready(pid) else 'no'}")
+    except (OSError, ToryfikatorError) as exc:
+        print(f"Tor service: unavailable ({exc})")
+    if not network_check:
+        print("No network request made. Use status --check to verify the exit address.")
+        return
+    if not active:
+        raise ToryfikatorError("Refusing an exit check without Toryfikator firewall rules. Run start first.")
+    require_binaries(CURL)
+    result = check_exit()
+    print(f"Public IP: {result['IP']}")
+    print(f"Tor exit: {'yes' if result['IsTor'] else 'no'}")
+    if not result["IsTor"]:
+        raise ToryfikatorError("Exit address is not recognised as Tor.")
+
+
+def interrupted(signum, frame) -> None:
+    raise KeyboardInterrupt
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Transparent Tor routing for Kali Linux / Debian.")
+    parser.add_argument("--version", action="version", version=VERSION)
+    commands = parser.add_subparsers(dest="command")
+    for name in ("start", "stop", "restart", "configure", "uninstall", "help"):
+        commands.add_parser(name)
+    status_parser = commands.add_parser("status")
+    status_parser.add_argument("--check", action="store_true", help="Contact Tor Project to verify the exit IP")
+    args = parser.parse_args(argv)
+    if args.command in (None, "help"):
+        parser.print_help()
+        return 0
+    previous_handler = signal.signal(signal.SIGTERM, interrupted)
+    try:
+        ensure_root()
+        with command_lock():
+            if args.command == "status":
+                show_status(args.check)
+            else:
+                actions = {"start": cmd_start, "restart": cmd_start, "stop": cmd_stop,
+                           "configure": cmd_configure, "uninstall": cmd_uninstall}
+                actions[args.command]()
+        return 0
+    except KeyboardInterrupt:
+        warn("Interrupted. Firewall rules were not removed; use stop to restore direct networking.")
+        return 130
+    except (OSError, ValueError, ToryfikatorError) as exc:
+        warn(str(exc))
+        return 1
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
 
 
 def cli_main() -> None:
-    main()
+    raise SystemExit(main())
 
 
 if __name__ == "__main__":
-    main()
+    cli_main()
