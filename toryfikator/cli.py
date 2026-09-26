@@ -16,7 +16,9 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "0.4.2"
+from toryfikator import __version__
+
+VERSION = __version__
 TORRC_PATH = Path("/etc/tor/torrc")
 TOR_DEFAULTS = Path("/usr/share/tor/tor-service-defaults-torrc")
 STATE_DIR = Path("/var/lib/toryfikator")

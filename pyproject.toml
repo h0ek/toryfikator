@@ -1,6 +1,6 @@
 [project]
 name = "toryfikator"
-version = "0.4.2"
+dynamic = ["version"]
 description = "Transparent Tor routing using nftables"
 authors = [{name = "Hoek"}]
 readme = "README.md"
@@ -15,3 +15,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["toryfikator*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "toryfikator.__version__"}
